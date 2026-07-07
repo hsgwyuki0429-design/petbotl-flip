@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ペットボトルフリップ・シミュレーター</title>
+<!-- Tailwind CSS CDN -->
+<script src="https://cdn.tailwindcss.com"></script>
+<!-- Matter.js CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  /* タッチ操作時のスクロール・ズームを完全に無効化 */
+  #game-container, #game-container canvas {
+    touch-action: none;
+  }
+</style>
+</head>
+<body class="bg-gray-100">
+
+<!-- ゲーム画面（Canvasはこの中に生成される） -->
+<div id="game-container" class="fixed inset-0"></div>
+
+<!-- 画面右上のクリアボタン -->
+<button id="clearBtn"
+        class="fixed top-3 right-3 z-10 px-4 py-1.5 text-sm font-semibold
+               text-gray-600 bg-white/90 border border-gray-300 rounded-full
+               shadow-sm hover:bg-gray-200 active:scale-95 transition">
+  クリア（Clear）
+</button>
+
+<!-- 左上の説明テキスト -->
+<div class="fixed top-3 left-3 z-10 text-xs text-gray-400 pointer-events-none leading-relaxed">
+  ボトル付近をタップ／クリックで キャップを掴む<br>
+  振り子のように振って、弾くように離すとフリップ！
+</div>
+
+<script>
+window.addEventListener('load', () => {
+  'use strict';
+
+  const { Engine, Render, Runner, Bodies, Body, Composite, Constraint, Vector, Sleeping } = Matter;
+
+  // =====================================================================
+  // ■ 物理パラメータ（調整はここ）
+  // =====================================================================
+
+  // --- ボトルの寸法（ピクセル） ---
+  const BOTTLE_W       = 44;    // ボトル胴体の外径（幅）
+  const BODY_H         = 89;    // 円柱部（胴体）の高さ
+  const SHOULDER_H     = 30;    // 円錐台部（肩）の高さ
+  const NECK_H         = 10;    // 首の高さ
+  const CAP_W          = 22;    // キャップの幅
+  const CAP_H          = 13;    // キャップの高さ
+  const WALL_T         = 6;    // 外殻の壁の厚み
+  const TOTAL_H        = WALL_T + BODY_H + SHOULDER_H + NECK_H + CAP_H; // 全高 ≒ 148
+
+  // --- 水（スライドする重り）---
+  // ボトル全高の 1/5 の高さの重りが、底からスライドして「水」を再現する
+  const WATER_H        = Math.round(TOTAL_H / 5);          // 水の高さ = 全高の1/5
+  const WATER_W        = BOTTLE_W - WALL_T * 2 - 2;        // 内壁より少し狭くしてスムーズに滑らせる
+
+  // --- 比重（密度）: 本物と同じ「外殻は軽く・水は重く」---
+  // 実物比: いろはす空ボトル約20g / 水(1/5)約110g ≒ 1 : 5.5
+  const SHELL_DENSITY  = 0.00012; // 外殻の密度（ペットボトルは非常に軽い）
+  const WATER_DENSITY  = 0.0012;  // 水の密度（外殻の実効質量の約5倍になるよう設定）
+
+  // --- 反発係数（跳ねすぎを防ぐため現実に合わせて非常に低く） ---
+  const BOTTLE_RESTITUTION = 0.15;  // ボトル外殻の反発係数（0.1〜0.2）
+  const WATER_RESTITUTION  = 0.05;  // 水（重り）の反発係数。着地時に暴れないよう最低レベル
+  const FLOOR_RESTITUTION  = 0.1;   // 床（木の学校机）の反発係数
+
+  // --- 摩擦係数 ---
+  // Matter.jsではペアの摩擦は min(A,B) で決まるため、両方とも高くする
+  const FLOOR_FRICTION        = 1.0;   // 床の摩擦（最大。滑らない机）
+  const FLOOR_STATIC_FRICTION = 10;    // 床の静止摩擦（ほぼ無限に滑らない）
+  const BOTTLE_FRICTION       = 0.9;   // ボトル外殻の摩擦（着地後に滑らないよう高く）
+  const WATER_FRICTION        = 0.02;  // 水と内壁の摩擦（水は殻の中をよく滑る）
+  const BOTTLE_AIR_FRICTION   = 0.008; // 空気抵抗（回転の伸びを現実的に減衰）
+
+  // --- 操作感 ---
+  const FINGER_SENSITIVITY = 1 / 3;   // 指の感度: 指の移動量の 1/3 だけジョイント目標が動く
+  const GRAB_STIFFNESS     = 0.06;    // マウスジョイント（ばね）の硬さ。低いほどぶら下がる
+  const GRAB_DAMPING       = 0.03;    // ばねの減衰。振り子の揺れの収まり具合
+
+  // --- その他 ---
+  const RESPAWN_DELAY  = 1100;  // リリース後、新しいボトルが湧くまでの時間(ms)
+  const MAX_SPEED      = 28;    // すり抜け防止のための最高速度クランプ(px/step)
+
+  // 衝突カテゴリ
+  const CAT_WORLD  = 0x0001; // 床・画面端の壁
+  const CAT_BOTTLE = 0x0002; // ボトル外殻
+  const CAT_WATER  = 0x0004; // 水（重り）
+
+  // =====================================================================
+  // ■ エンジン・レンダラーのセットアップ
+  // =====================================================================
+
+  const engine = Engine.create({
+    enableSleeping: true,
+    positionIterations: 12,  // 薄い壁でのすり抜け防止のため反復回数を増やす
+    velocityIterations: 8,
+    constraintIterations: 4,
+  });
+  const world = engine.world;
+  // 重力（Matter.jsのデフォルトスケールで現実の 9.8 m/s^2 相当）
+  engine.gravity.y = 1;
+
+  const container = document.getElementById('game-container');
+  let W = window.innerWidth;
+  let H = window.innerHeight;
+
+  const render = Render.create({
+    element: container,
+    engine: engine,
+    options: {
+      width: W,
+      height: H,
+      pixelRatio: window.devicePixelRatio || 1,
+      wireframes: false,
+      background: '#f7f7f8', // シンプルな薄いグレー背景
+    },
+  });
+
+  // =====================================================================
+  // ■ 床（学校の机）と画面端の壁
+  // =====================================================================
+
+  const FLOOR_H = 70;
+  const floor = Bodies.rectangle(W / 2, H - FLOOR_H / 2, 10000, FLOOR_H, {
+    isStatic: true,
+    friction: FLOOR_FRICTION,             // 摩擦最大：着地したボトルが滑らない
+    frictionStatic: FLOOR_STATIC_FRICTION,
+    restitution: FLOOR_RESTITUTION,       // 木の机なのでほとんど跳ねない
+    collisionFilter: { category: CAT_WORLD, mask: CAT_BOTTLE },
+    render: { fillStyle: '#b98d5f' },     // 木の机の色
+  });
+
+  // 画面外へボトルが飛び出さないよう左右に透明な壁を置く
+  const wallOpts = {
+    isStatic: true,
+    friction: 0.1,
+    restitution: 0.3,
+    collisionFilter: { category: CAT_WORLD, mask: CAT_BOTTLE },
+    render: { visible: false },
+  };
+  const leftWall  = Bodies.rectangle(-25, H / 2 - 1000, 50, 6000, wallOpts);
+  const rightWall = Bodies.rectangle(W + 25, H / 2 - 1000, 50, 6000, wallOpts);
+
+  Composite.add(world, [floor, leftWall, rightWall]);
+
+  // =====================================================================
+  // ■ ボトルの生成
+  // =====================================================================
+  //
+  // 【水の再現について】
+  // Matter.js には Box2D のような Prismatic Joint（スライダー）が無いため、
+  // 完全に等価な構造として「外殻を中空の複合ボディ（左右の壁・底・肩・首）」
+  // で作り、その内部に重り（水）を閉じ込める方式でスライダーを実現する。
+  // 重りは内壁に挟まれて長軸方向にしかスライドできず（＝Prismatic Joint と
+  // 同じ拘束）、衝突グループにより「自分のボトルの殻」とだけ衝突するため、
+  // 床や他のボトルとは一切干渉しない。
+  // 空中では遠心力で水が底に張り付き、着地の瞬間に水が底へ落ちて重心が
+  // 下がり「ピタッ」と止まる、現実と同じ挙動になる。
+
+  const bottles = []; // { shell, water, group }
+
+  // 2点間を結ぶ回転した壁（矩形）を作るヘルパー
+  function wallBetween(x1, y1, x2, y2, thickness, opts) {
+    const cx = (x1 + x2) / 2;
+    const cy = (y1 + y2) / 2;
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    const angle = Math.atan2(y2 - y1, x2 - x1);
+    return Bodies.rectangle(cx, cy, len, thickness, { angle, ...opts });
+  }
+
+  function createBottle(x, y) {
+    // このボトル専用の衝突グループ（正の値 = 同グループ同士は必ず衝突）
+    const group = Body.nextGroup(false);
+
+    const shellFilter = { group, category: CAT_BOTTLE, mask: CAT_WORLD | CAT_BOTTLE };
+    const shellRender = {
+      fillStyle: 'rgba(165, 210, 240, 0.55)',   // 半透明の薄い水色（いろはす風）
+      strokeStyle: 'rgba(120, 175, 215, 0.9)',
+      lineWidth: 1,
+    };
+    const partOpts = {
+      collisionFilter: shellFilter,
+      render: shellRender,
+    };
+
+    const halfH = TOTAL_H / 2;
+    const bodyTopY = halfH - WALL_T - BODY_H;   // 胴体上端（ローカルY）
+    const neckHalfW = CAP_W / 2 - 3;            // 首の半幅
+
+    // --- 外殻のパーツ群（ローカル座標: 中心が(0,0)、上がキャップ） ---
+    const parts = [
+      // 底
+      Bodies.rectangle(0, halfH - WALL_T / 2, BOTTLE_W, WALL_T, partOpts),
+      // 左右の胴体壁（円柱部）
+      Bodies.rectangle(-(BOTTLE_W - WALL_T) / 2, halfH - WALL_T - BODY_H / 2, WALL_T, BODY_H, partOpts),
+      Bodies.rectangle( (BOTTLE_W - WALL_T) / 2, halfH - WALL_T - BODY_H / 2, WALL_T, BODY_H, partOpts),
+      // 肩（円錐台部）: 胴体から首へ絞る斜めの壁
+      wallBetween(-(BOTTLE_W - WALL_T) / 2, bodyTopY, -neckHalfW, bodyTopY - SHOULDER_H, WALL_T, partOpts),
+      wallBetween( (BOTTLE_W - WALL_T) / 2, bodyTopY,  neckHalfW, bodyTopY - SHOULDER_H, WALL_T, partOpts),
+      // 首
+      Bodies.rectangle(-neckHalfW, bodyTopY - SHOULDER_H - NECK_H / 2, WALL_T, NECK_H, partOpts),
+      Bodies.rectangle( neckHalfW, bodyTopY - SHOULDER_H - NECK_H / 2, WALL_T, NECK_H, partOpts),
+      // キャップ（掴む場所。いろはす風の白いキャップ）
+      Bodies.rectangle(0, bodyTopY - SHOULDER_H - NECK_H - CAP_H / 2, CAP_W, CAP_H, {
+        collisionFilter: shellFilter,
+        render: { fillStyle: '#f3f4f6', strokeStyle: '#9ca3af', lineWidth: 1 },
+        label: 'cap',
+      }),
+    ];
+
+    const shell = Body.create({
+      parts,
+      density: SHELL_DENSITY,            // 外殻は非常に軽い
+      friction: BOTTLE_FRICTION,
+      frictionStatic: 1,
+      restitution: BOTTLE_RESTITUTION,   // 跳ねすぎ防止：現実のペットボトル相当
+      frictionAir: BOTTLE_AIR_FRICTION,
+      collisionFilter: shellFilter,
+      label: 'bottleShell',
+    });
+    Body.setPosition(shell, { x, y });
+
+    // --- 水（スライドする重り） ---
+    // 底面の内側にぴったり収まるように配置する
+    const waterLocalY = halfH - WALL_T - WATER_H / 2; // 底の内面に接する位置
+    const water = Bodies.rectangle(x, y + waterLocalY, WATER_W, WATER_H, {
+      density: WATER_DENSITY,            // 水は重い（本物と同じ比重バランス）
+      friction: WATER_FRICTION,          // 内壁をよく滑る
+      frictionStatic: 0.05,
+      restitution: WATER_RESTITUTION,
+      frictionAir: 0,
+      // 自分のボトルの殻とだけ衝突（mask:0 でも正のgroupが優先されて衝突する）
+      collisionFilter: { group, category: CAT_WATER, mask: 0 },
+      render: { fillStyle: 'rgba(66, 153, 225, 0.85)' }, // 水の青
+      label: 'water',
+    });
+
+    Composite.add(world, [shell, water]);
+    const bottle = { shell, water, group };
+    bottles.push(bottle);
+    return bottle;
+  }
+
+  // キャップパーツ（世界座標での掴みポイント）を取得
+  function getCapPart(shell) {
+    return shell.parts.find(p => p.label === 'cap') || shell;
+  }
+
+  // =====================================================================
+  // ■ 操作：キャップを掴む（マウス＆タッチ両対応）
+  // =====================================================================
+  //
+  // 画面をタップ／クリック → 最も近いボトルのキャップにばね（マウスジョイント）
+  // を接続してぶら下げる。指の移動量は 1/3 に減衰され、重い振り子のような
+  // 操作感になる。指を離すとジョイントが外れ、その瞬間のボトルの速度・
+  // 角速度（＝指の軌道の曲がり具合や弾き方がばねを通して伝わったもの）が
+  // そのまま飛翔と回転（スピン）になる。
+
+  let grabConstraint = null;   // 現在のばねジョイント
+  let grabbedBottle  = null;   // 掴んでいるボトル
+  let anchor         = null;   // ジョイントの目標座標（ばねの支点）
+  let lastPointer    = null;   // 前フレームの指の位置
+  let pointerId      = null;   // マルチタッチ対策：最初の指だけを追跡
+
+  function canvasPos(clientX, clientY) {
+    const rect = render.canvas.getBoundingClientRect();
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }
+
+  function grabStart(pos) {
+    if (grabConstraint || bottles.length === 0) return;
+
+    // 最も近いボトル（キャップとの距離）を探す
+    let nearest = null;
+    let bestD = Infinity;
+    for (const b of bottles) {
+      const cap = getCapPart(b.shell);
+      const d = Vector.magnitude(Vector.sub(cap.position, pos));
+      if (d < bestD) { bestD = d; nearest = b; }
+    }
+    if (!nearest) return;
+
+    const shell = nearest.shell;
+    const cap = getCapPart(shell);
+    Sleeping.set(shell, false);
+    Sleeping.set(nearest.water, false);
+
+    // ばねの支点はキャップの現在位置から開始（初期テンションゼロ）
+    anchor = { x: cap.position.x, y: cap.position.y };
+    lastPointer = { ...pos };
+
+    grabConstraint = Constraint.create({
+      bodyA: shell,
+      // キャップ中心をボトルローカル座標で指定（ボトルの回転に追従する）
+      pointA: Vector.sub(cap.position, shell.position),
+      pointB: { ...anchor },
+      length: 0,
+      stiffness: GRAB_STIFFNESS,  // 柔らかいばね：ぶら下がり感
+      damping: GRAB_DAMPING,
+      render: { visible: true, strokeStyle: 'rgba(150,150,150,0.5)', lineWidth: 1, type: 'line' },
+    });
+    Composite.add(world, grabConstraint);
+    grabbedBottle = nearest;
+  }
+
+  function grabMove(pos) {
+    if (!grabConstraint || !lastPointer) return;
+    // 【指の感度 1/3】指の移動量の 1/3 だけ支点を動かす → 重さと抵抗感を演出
+    anchor.x += (pos.x - lastPointer.x) * FINGER_SENSITIVITY;
+    anchor.y += (pos.y - lastPointer.y) * FINGER_SENSITIVITY;
+    lastPointer = { ...pos };
+    grabConstraint.pointB.x = anchor.x;
+    grabConstraint.pointB.y = anchor.y;
+    Sleeping.set(grabbedBottle.shell, false);
+    Sleeping.set(grabbedBottle.water, false);
+  }
+
+  function grabEnd() {
+    if (!grabConstraint) return;
+    // ジョイント解除：リリース瞬間の速度と角速度がそのままスピンになる
+    Composite.remove(world, grabConstraint);
+    grabConstraint = null;
+    grabbedBottle = null;
+    anchor = null;
+    lastPointer = null;
+
+    // しばらくして新しいボトルを画面中央付近に生成（無限ボトル）
+    setTimeout(spawnBottle, RESPAWN_DELAY);
+  }
+
+  // --- マウスイベント（PC） ---
+  render.canvas.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    grabStart(canvasPos(e.clientX, e.clientY));
+  });
+  window.addEventListener('mousemove', (e) => {
+    grabMove(canvasPos(e.clientX, e.clientY));
+  });
+  window.addEventListener('mouseup', () => grabEnd());
+
+  // --- タッチイベント（モバイル） ---
+  render.canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault(); // スクロールと合成マウスイベントを抑止
+    if (pointerId !== null) return;
+    const t = e.changedTouches[0];
+    pointerId = t.identifier;
+    grabStart(canvasPos(t.clientX, t.clientY));
+  }, { passive: false });
+
+  render.canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (t.identifier === pointerId) {
+        grabMove(canvasPos(t.clientX, t.clientY));
+      }
+    }
+  }, { passive: false });
+
+  const onTouchEnd = (e) => {
+    for (const t of e.changedTouches) {
+      if (t.identifier === pointerId) {
+        pointerId = null;
+        grabEnd();
+      }
+    }
+  };
+  render.canvas.addEventListener('touchend', onTouchEnd);
+  render.canvas.addEventListener('touchcancel', onTouchEnd);
+
+  // =====================================================================
+  // ■ ボトルの生成と削除
+  // =====================================================================
+
+  function spawnBottle() {
+    // 画面中央付近の空中に生成（少しだけ位置をランダムに）
+    const x = W / 2 + (Math.random() - 0.5) * 60;
+    const y = H * 0.35;
+    createBottle(x, y);
+  }
+
+  // クリアボタン：存在する全ボトルを削除
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    grabEnd(); // 掴み中なら解除（解除に伴うリスポーンは残す）
+    for (const b of bottles) {
+      Composite.remove(world, b.shell);
+      Composite.remove(world, b.water);
+    }
+    bottles.length = 0;
+    spawnBottle();
+  });
+
+  // =====================================================================
+  // ■ 毎フレーム処理（速度クランプ・画面外の掃除）
+  // =====================================================================
+
+  Matter.Events.on(engine, 'beforeUpdate', () => {
+    for (let i = bottles.length - 1; i >= 0; i--) {
+      const b = bottles[i];
+
+      // 高速時のすり抜け（トンネリング）防止：速度に上限をかける
+      for (const body of [b.shell, b.water]) {
+        const speed = Vector.magnitude(body.velocity);
+        if (speed > MAX_SPEED) {
+          Body.setVelocity(body, Vector.mult(Vector.normalise(body.velocity), MAX_SPEED));
+        }
+      }
+
+      // 万一画面のはるか下へ落ちたボトルは削除
+      if (b.shell.position.y > H + 600) {
+        Composite.remove(world, b.shell);
+        Composite.remove(world, b.water);
+        bottles.splice(i, 1);
+      }
+    }
+  });
+
+  // =====================================================================
+  // ■ リサイズ対応
+  // =====================================================================
+
+  window.addEventListener('resize', () => {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    render.options.width = W;
+    render.options.height = H;
+    Render.setPixelRatio(render, window.devicePixelRatio || 1);
+    render.bounds.max.x = W;
+    render.bounds.max.y = H;
+    // 床と壁を新しい画面サイズに合わせて置き直す
+    Body.setPosition(floor, { x: W / 2, y: H - FLOOR_H / 2 });
+    Body.setPosition(leftWall, { x: -25, y: H / 2 - 1000 });
+    Body.setPosition(rightWall, { x: W + 25, y: H / 2 - 1000 });
+  });
+
+  // =====================================================================
+  // ■ 実行開始
+  // =====================================================================
+
+  Render.run(render);
+  const runner = Runner.create();
+  Runner.run(runner, engine);
+
+  // 最初のボトルを生成
+  spawnBottle();
+});
+</script>
+</body>
+</html>
