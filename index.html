@@ -415,8 +415,28 @@ window.addEventListener('load', () => {
     // 画面中央（横方向）の机のすぐ上に生成（少しだけ位置をランダムに）
     // ※現実スケールの重力では高所から落とすと激突してしまうため、
     //   机の少し上に「置かれる」ように生成する
-    const x = W / 2 + (Math.random() - 0.5) * 60;
     const y = H - FLOOR_H - TOTAL_H / 2 - 12;
+
+    // 既存のボトルと重なる位置に生成すると、互いにめり込んで絡まったまま
+    // 動かなくなるため、既存ボトルから十分離れた空き場所を探して生成する
+    const clearance = TOTAL_H / 2 + BOTTLE_W; // 横倒しのボトルの長さも考慮した余白
+    const isClear = (cx) => bottles.every(b =>
+      Math.hypot(b.shell.position.x - cx, b.shell.position.y - y) > clearance);
+
+    let x = W / 2 + (Math.random() - 0.5) * 60;
+    if (!isClear(x)) {
+      // 画面中央に近い順に空き場所を探す
+      const candidates = [];
+      for (let cx = BOTTLE_W; cx <= W - BOTTLE_W; cx += 20) candidates.push(cx);
+      candidates.sort((a, b) => Math.abs(a - W / 2) - Math.abs(b - W / 2));
+      const found = candidates.find(isClear);
+      if (found === undefined) {
+        // 机の上が満杯なら、空きができるのを待って再試行
+        setTimeout(spawnBottle, RESPAWN_DELAY);
+        return;
+      }
+      x = found;
+    }
     createBottle(x, y);
   }
 
