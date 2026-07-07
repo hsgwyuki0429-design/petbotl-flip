@@ -47,7 +47,7 @@
 window.addEventListener('load', () => {
   'use strict';
 
-  const { Engine, Render, Runner, Bodies, Body, Composite, Constraint, Vector, Sleeping } = Matter;
+  const { Engine, Render, Bodies, Body, Composite, Constraint, Vector, Sleeping } = Matter;
 
   // =====================================================================
   // ■ 物理パラメータ（調整はここ）
@@ -60,8 +60,12 @@ window.addEventListener('load', () => {
   const NECK_H         = 10;    // 首の高さ
   const CAP_W          = 22;    // キャップの幅
   const CAP_H          = 13;    // キャップの高さ
-  const WALL_T         = 6;    // 外殻の壁の厚み
-  const TOTAL_H        = WALL_T + BODY_H + SHOULDER_H + NECK_H + CAP_H; // 全高 ≒ 148
+  const WALL_T         = 8;     // 外殻の壁の厚み（薄すぎると水がすり抜けるため8px）
+  const TOTAL_H        = WALL_T + BODY_H + SHOULDER_H + NECK_H + CAP_H; // 全高 = 150
+
+  // --- 現実スケール ---
+  // ボトル全高150px = 実物のいろはす約21cm として換算する
+  const PX_PER_METER   = TOTAL_H / 0.21;  // 約714px/m
 
   // --- 水（スライドする重り）---
   // ボトル全高の 1/5 の高さの重りが、底からスライドして「水」を再現する
@@ -88,12 +92,19 @@ window.addEventListener('load', () => {
 
   // --- 操作感 ---
   const FINGER_SENSITIVITY = 1 / 3;   // 指の感度: 指の移動量の 1/3 だけジョイント目標が動く
-  const GRAB_STIFFNESS     = 0.06;    // マウスジョイント（ばね）の硬さ。低いほどぶら下がる
-  const GRAB_DAMPING       = 0.03;    // ばねの減衰。振り子の揺れの収まり具合
+  const GRAB_STIFFNESS     = 0.08;    // マウスジョイント（ばね）の硬さ。低いほどぶら下がる
+  const GRAB_DAMPING       = 0.04;    // ばねの減衰。振り子の揺れの収まり具合
 
   // --- その他 ---
   const RESPAWN_DELAY  = 1100;  // リリース後、新しいボトルが湧くまでの時間(ms)
-  const MAX_SPEED      = 28;    // すり抜け防止のための最高速度クランプ(px/step)
+  const MAX_SPEED      = 40;    // すり抜け防止のための最高速度クランプ(px/16.6ms)
+  const MAX_ANGULAR    = 0.6;   // 最高角速度クランプ(rad/16.6ms ≒ 36rad/s ≒ 毎秒5.7回転)
+
+  // --- 物理演算の精度 ---
+  // 高速な衝突でも壁をすり抜けないよう、1フレーム(60fps)を4分割して
+  // 240Hzで物理演算を行う（サブステッピング）
+  const PHYSICS_SUBSTEPS = 4;
+  const FIXED_DT = 1000 / 60 / PHYSICS_SUBSTEPS; // 物理1ステップの時間(ms)
 
   // 衝突カテゴリ
   const CAT_WORLD  = 0x0001; // 床・画面端の壁
@@ -111,8 +122,13 @@ window.addEventListener('load', () => {
     constraintIterations: 4,
   });
   const world = engine.world;
-  // 重力（Matter.jsのデフォルトスケールで現実の 9.8 m/s^2 相当）
-  engine.gravity.y = 1;
+
+  // 【現実スケールの重力】
+  // 実際の重力加速度 9.8m/s^2 をピクセルスケール(約714px/m)に換算すると
+  // 約7000px/s^2。Matter.jsの gravity=1 は約1000px/s^2 に相当するため、
+  // 9.8 * PX_PER_METER / 1000 ≒ 7.0 を設定する。
+  // （デフォルトの1のままだと月面のようなふわふわしたスローモーションになる）
+  engine.gravity.y = 9.8 * PX_PER_METER / 1000;
 
   const container = document.getElementById('game-container');
   let W = window.innerWidth;
@@ -204,7 +220,7 @@ window.addEventListener('load', () => {
     // --- 外殻のパーツ群（ローカル座標: 中心が(0,0)、上がキャップ） ---
     const parts = [
       // 底
-      Bodies.rectangle(0, halfH - WALL_T / 2, BOTTLE_W, WALL_T, partOpts),
+      Bodies.rectangle(0, halfH - WALL_T / 2, BOTTLE_W, WALL_T, { ...partOpts, label: 'bottom' }),
       // 左右の胴体壁（円柱部）
       Bodies.rectangle(-(BOTTLE_W - WALL_T) / 2, halfH - WALL_T - BODY_H / 2, WALL_T, BODY_H, partOpts),
       Bodies.rectangle( (BOTTLE_W - WALL_T) / 2, halfH - WALL_T - BODY_H / 2, WALL_T, BODY_H, partOpts),
@@ -232,12 +248,17 @@ window.addEventListener('load', () => {
       collisionFilter: shellFilter,
       label: 'bottleShell',
     });
+    // 複合ボディの position は重心。幾何中心(構築時の原点)とのズレを記録しておく
+    const comOffsetLocal = { x: shell.position.x, y: shell.position.y };
     Body.setPosition(shell, { x, y });
 
     // --- 水（スライドする重り） ---
-    // 底面の内側にぴったり収まるように配置する
-    const waterLocalY = halfH - WALL_T - WATER_H / 2; // 底の内面に接する位置
-    const water = Bodies.rectangle(x, y + waterLocalY, WATER_W, WATER_H, {
+    // 複合ボディの position は「重心」であり幾何中心とはズレるため、
+    // 底パーツの実際の位置を基準に配置する（めり込み＝当たり判定の暴れを防止）
+    const bottomPart = shell.parts.find(p => p.label === 'bottom');
+    const waterX = bottomPart.position.x;
+    const waterY = bottomPart.position.y - WALL_T / 2 - WATER_H / 2 - 1; // 底の内面から1px浮かせる
+    const water = Bodies.rectangle(waterX, waterY, WATER_W, WATER_H, {
       density: WATER_DENSITY,            // 水は重い（本物と同じ比重バランス）
       friction: WATER_FRICTION,          // 内壁をよく滑る
       frictionStatic: 0.05,
@@ -250,10 +271,15 @@ window.addEventListener('load', () => {
     });
 
     Composite.add(world, [shell, water]);
-    const bottle = { shell, water, group };
+    const bottle = { shell, water, group, comOffsetLocal };
     bottles.push(bottle);
     return bottle;
   }
+
+  // 水がボトル内部で取り得るローカル座標の範囲（スライダーの可動域）
+  const WATER_X_MAX = (BOTTLE_W - 2 * WALL_T - WATER_W) / 2;              // 横方向の遊び
+  const WATER_Y_MIN = (TOTAL_H / 2 - WALL_T - BODY_H) + WATER_H / 2;     // 上端（肩の付け根）
+  const WATER_Y_MAX = TOTAL_H / 2 - WALL_T - WATER_H / 2;                // 下端（底の内面）
 
   // キャップパーツ（世界座標での掴みポイント）を取得
   function getCapPart(shell) {
@@ -386,9 +412,11 @@ window.addEventListener('load', () => {
   // =====================================================================
 
   function spawnBottle() {
-    // 画面中央付近の空中に生成（少しだけ位置をランダムに）
+    // 画面中央（横方向）の机のすぐ上に生成（少しだけ位置をランダムに）
+    // ※現実スケールの重力では高所から落とすと激突してしまうため、
+    //   机の少し上に「置かれる」ように生成する
     const x = W / 2 + (Math.random() - 0.5) * 60;
-    const y = H * 0.35;
+    const y = H - FLOOR_H - TOTAL_H / 2 - 12;
     createBottle(x, y);
   }
 
@@ -411,11 +439,37 @@ window.addEventListener('load', () => {
     for (let i = bottles.length - 1; i >= 0; i--) {
       const b = bottles[i];
 
-      // 高速時のすり抜け（トンネリング）防止：速度に上限をかける
+      // 高速時のすり抜け（トンネリング）防止：速度と角速度に上限をかける
       for (const body of [b.shell, b.water]) {
         const speed = Vector.magnitude(body.velocity);
         if (speed > MAX_SPEED) {
           Body.setVelocity(body, Vector.mult(Vector.normalise(body.velocity), MAX_SPEED));
+        }
+        if (Math.abs(body.angularVelocity) > MAX_ANGULAR) {
+          Body.setAngularVelocity(body, Math.sign(body.angularVelocity) * MAX_ANGULAR);
+        }
+      }
+
+      // 【すり抜け安全ネット（Prismatic Jointの可動域拘束）】
+      // 万一水が壁を貫通した場合、ボトルローカル座標に変換して可動域内へ
+      // 引き戻す。通常の接触は衝突解決に任せ、4px以上の貫通時のみ介入する。
+      {
+        const shell = b.shell;
+        const geoCenter = Vector.sub(shell.position, Vector.rotate(b.comOffsetLocal, shell.angle));
+        const local = Vector.rotate(Vector.sub(b.water.position, geoCenter), -shell.angle);
+        const escaped =
+          Math.abs(local.x) > WATER_X_MAX + 4 ||
+          local.y < WATER_Y_MIN - 4 || local.y > WATER_Y_MAX + 4;
+        if (escaped) {
+          const clamped = {
+            x: Math.max(-WATER_X_MAX, Math.min(WATER_X_MAX, local.x)),
+            y: Math.max(WATER_Y_MIN, Math.min(WATER_Y_MAX, local.y)),
+          };
+          Body.setPosition(b.water, Vector.add(geoCenter, Vector.rotate(clamped, shell.angle)));
+          Body.setAngle(b.water, shell.angle);
+          // 相対速度を殺して殻と同じ運動に戻す（弾き飛びを防ぐ）
+          Body.setVelocity(b.water, shell.velocity);
+          Body.setAngularVelocity(b.water, shell.angularVelocity);
         }
       }
 
@@ -451,8 +505,24 @@ window.addEventListener('load', () => {
   // =====================================================================
 
   Render.run(render);
-  const runner = Runner.create();
-  Runner.run(runner, engine);
+
+  // 【固定タイムステップ 240Hz の物理ループ】
+  // Runnerの代わりに自前のループで1フレームを4分割して更新する。
+  // ステップあたりの移動量が1/4になるため、高速な衝突でも
+  // 水や床をすり抜けず、当たり判定が正確になる。
+  // また画面のリフレッシュレート(60/120Hz)に依存せず実時間で進行する。
+  let accumulator = 0;
+  let lastTime = performance.now();
+  function physicsLoop(now) {
+    requestAnimationFrame(physicsLoop);
+    accumulator += Math.min(now - lastTime, 100); // タブ復帰時の暴走防止
+    lastTime = now;
+    while (accumulator >= FIXED_DT) {
+      Engine.update(engine, FIXED_DT);
+      accumulator -= FIXED_DT;
+    }
+  }
+  requestAnimationFrame(physicsLoop);
 
   // 最初のボトルを生成
   spawnBottle();
